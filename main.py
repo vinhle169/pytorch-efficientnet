@@ -150,8 +150,9 @@ class EfficientNet(nn.Module):
         self.include_top = include_top
         self.dropout_rate = dropout_rate
         self.pooling = pooling
-        self.conv1 = nn.Conv2d(num_channels, 32, kernel_size=3, stride=2, padding="valid", bias=False)
-        self.batch_norm1 = nn.BatchNorm2d(num_channels)
+        init_filters = round_filters(32)
+        self.conv1 = nn.Conv2d(num_channels, init_filters, kernel_size=3, stride=2, padding="valid", bias=False)
+        self.batch_norm1 = nn.BatchNorm2d(init_filters)
         self.swish = torch.nn.SiLU()
         b = 0
         blocks = float(sum(args['repeats'] for args in DEFAULT_BLOCKS_ARGS))
@@ -223,21 +224,29 @@ class Block(nn.Module):
         filters = filters_in * expand_ratio
         self.expand_ratio = expand_ratio
         self.strides = strides
+        self.filters_in = filters_in
+        self.filters_out = filters_out
         self.id_skip = id_skip
         self.swish = torch.nn.SiLU()
         self.se_ratio = se_ratio
-        self.batch_norm_0 = nn.BatchNorm2d(filters)
+        print('-----------NEW BLOCK ----------------')
+        print('filters in:', filters_in)
         if expand_ratio != 1:
             self.conv_expand = nn.Conv2d(filters_in, filters, kernel_size=1, padding='same', bias=False)
             self.batch_norm_exp = nn.BatchNorm2d(filters)
         conv_pad = "valid" if self.strides == 2 else "same"
         self.depth_conv = nn.Conv2d(filters, filters * self.expand_ratio, kernel_size=self.kernel_size, stride=strides, padding=conv_pad,
-                                    bias=False, groups=self.expand_ratio)
+                                    bias=False, groups=filters)
+        print(self.depth_conv.weight.shape)
+        self.batch_norm_depth = nn.BatchNorm2d(filters * self.expand_ratio)
         if 0 < self.se_ratio <= 1:
+
             filters_se = max(1, int(filters_in * se_ratio))
+            print('filters se:', filters_se)
             # implemented as https://github.com/keras-team/keras/blob/v2.11.0/keras/layers/pooling/global_average_pooling2d.py
             # assuming channels first because torch
             self.global_average_pooling_2d = lambda x: torch.mean(x, (2, 3), keepdim=True)
+            print('filters:',filters)
             self.conv_se_reduce = nn.Conv2d(filters, filters_se, 1, padding="same")
             self.sigmoid = torch.nn.Sigmoid()
             self.conv_se_expand = nn.Conv2d(filters_se, filters, 1, padding="same")
@@ -253,15 +262,17 @@ class Block(nn.Module):
             x = self.batch_norm_exp(x)
             x = self.swish(x)
         # if need to account for stride
-        if self.stride == 2:
+        if self.strides == 2:
             padding = correct_pad(x, self.kernel_size)
             x = F.pad(input=x, pad=padding, value=0)
         x = self.depth_conv(x)
-        x = self.batch_norm_0(x)
+        x = self.batch_norm_depth(x)
         x = self.swish(x)
         # squeeze and excitation
         if 0 < self.se_ratio <= 1:
+            print(x.shape, 'shape before pooling')
             se = self.global_average_pooling_2d(x)
+            print(se.shape, 'shape before se reduce conv')
             se = self.conv_se_reduce(se)
             se = self.swish(se)
             se = self.conv_se_expand(se)
@@ -271,7 +282,7 @@ class Block(nn.Module):
         x = self.conv_output(x)
         x = self.batch_norm_last(x)
 
-        if self.id_skip and self.strides == 1 and filters_in == filters_out:
+        if self.id_skip and self.strides == 1 and self.filters_in == self.filters_out:
             if drop_rate > 0:
                 x = self.dropout(x)
             x = torch.add(x, inputs)
@@ -307,3 +318,6 @@ if __name__ == '__main__':
 
 
     model = EfficientNetB0()
+    inp = torch.randn((1,3,200,200))
+    y = model(inp)
+    print(y.shape)
