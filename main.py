@@ -234,10 +234,11 @@ class Block(nn.Module):
         if expand_ratio != 1:
             self.conv_expand = nn.Conv2d(filters_in, filters, kernel_size=1, padding='same', bias=False)
             self.batch_norm_exp = nn.BatchNorm2d(filters)
+
         conv_pad = "valid" if self.strides == 2 else "same"
         self.depth_conv = nn.Conv2d(filters, filters * self.expand_ratio, kernel_size=self.kernel_size, stride=strides, padding=conv_pad,
                                     bias=False, groups=filters)
-        print(self.depth_conv.weight.shape)
+        print(self.depth_conv.weight.shape, 'depth')
         self.batch_norm_depth = nn.BatchNorm2d(filters * self.expand_ratio)
         if 0 < self.se_ratio <= 1:
 
@@ -253,6 +254,7 @@ class Block(nn.Module):
         self.conv_output = nn.Conv2d(filters, filters_out, 1, padding="same", bias=False)
         self.batch_norm_last = nn.BatchNorm2d(filters_out)
         self.dropout = nn.Dropout(p=drop_rate)
+        print(self.conv_output.weight.shape)
 
     def forward(self, inputs):
         x = inputs
