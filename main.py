@@ -1,6 +1,7 @@
 import torch
 import torchvision
 import h5py
+import copy
 # import numpy as np
 # import tensorflow as tf
 # import efficientnet.tfkeras as efn
@@ -18,6 +19,7 @@ import torchvision.transforms as transforms
 #             ## simple module
 #             n = int(n)
 #             model[n] = new
+
 DEFAULT_BLOCKS_ARGS = [
     {
         "kernel_size": 3,
@@ -136,13 +138,25 @@ def correct_pad(inputs, kernel_size):
     )
 
 
+class depthwise_separable_conv(nn.Module):
+    def __init__(self, nin, kernels_per_layer, nout):
+        super(depthwise_separable_conv, self).__init__()
+        self.depthwise = nn.Conv2d(nin, nin*kernels_per_layer, kernel_size=3, padding=1, groups=nin)
+        self.pointwise = nn.Conv2d(nin*kernels_per_layer, nout, kernel_size=1)
+
+    def forward(self, x):
+        out = self.depthwise(x)
+        out = self.pointwise(out)
+        return out
+
+
 class EfficientNet(nn.Module):
 
-    def __init__(self, num_channels=3, dropout_rate=0.2, drop_connect_rate=0.2, include_top=True, pooling=None,
-                 classes=1000):
+    def __init__(self, num_channels=5, dropout_rate=0.2, drop_connect_rate=0.2, include_top=True, pooling=None,
+                 classes=1000, block_args = DEFAULT_BLOCKS_ARGS):
 
         super().__init__()
-        global DEFAULT_BLOCKS_ARGS
+        block_args = copy.deepcopy(DEFAULT_BLOCKS_ARGS)
         self.transforms = torch.nn.Sequential(
             # transforms.to_tensor(),
             transforms.Normalize(0, 1)
@@ -155,9 +169,11 @@ class EfficientNet(nn.Module):
         self.batch_norm1 = nn.BatchNorm2d(init_filters)
         self.swish = torch.nn.SiLU()
         b = 0
-        blocks = float(sum(args['repeats'] for args in DEFAULT_BLOCKS_ARGS))
+        for arg in DEFAULT_BLOCKS_ARGS:
+            print(arg)
+        blocks = float(sum(args['repeats'] for args in block_args))
         self.block_list = nn.ModuleList([])
-        for i, args in enumerate(DEFAULT_BLOCKS_ARGS):
+        for i, args in enumerate(block_args):
             assert args['repeats'] > 0
             args["filters_in"] = round_filters(args["filters_in"])
             args["filters_out"] = round_filters(args["filters_out"])
@@ -211,6 +227,7 @@ class EfficientNet(nn.Module):
         else:
             if self.pooling is not None:
                 x = self.pool(x)
+        return x
 
 
 class Block(nn.Module):
@@ -227,34 +244,30 @@ class Block(nn.Module):
         self.filters_in = filters_in
         self.filters_out = filters_out
         self.id_skip = id_skip
+        self.drop_rate = drop_rate
         self.swish = torch.nn.SiLU()
         self.se_ratio = se_ratio
-        print('-----------NEW BLOCK ----------------')
-        print('filters in:', filters_in)
         if expand_ratio != 1:
             self.conv_expand = nn.Conv2d(filters_in, filters, kernel_size=1, padding='same', bias=False)
             self.batch_norm_exp = nn.BatchNorm2d(filters)
 
         conv_pad = "valid" if self.strides == 2 else "same"
-        self.depth_conv = nn.Conv2d(filters, filters * self.expand_ratio, kernel_size=self.kernel_size, stride=strides, padding=conv_pad,
-                                    bias=False, groups=filters)
-        print(self.depth_conv.weight.shape, 'depth')
+        self.depth_conv = depthwise_separable_conv(filters, self.kernel_size, filters*self.expand_ratio)
+        # self.depth_conv = nn.Conv2d(filters, filters * self.expand_ratio, kernel_size=self.kernel_size, stride=strides, padding=conv_pad,
+        #                             bias=False, groups=filters)
         self.batch_norm_depth = nn.BatchNorm2d(filters * self.expand_ratio)
         if 0 < self.se_ratio <= 1:
 
             filters_se = max(1, int(filters_in * se_ratio))
-            print('filters se:', filters_se)
             # implemented as https://github.com/keras-team/keras/blob/v2.11.0/keras/layers/pooling/global_average_pooling2d.py
             # assuming channels first because torch
             self.global_average_pooling_2d = lambda x: torch.mean(x, (2, 3), keepdim=True)
-            print('filters:',filters)
-            self.conv_se_reduce = nn.Conv2d(filters, filters_se, 1, padding="same")
+            self.conv_se_reduce = nn.Conv2d(filters*self.expand_ratio, filters_se, 1, padding="same")
             self.sigmoid = torch.nn.Sigmoid()
-            self.conv_se_expand = nn.Conv2d(filters_se, filters, 1, padding="same")
-        self.conv_output = nn.Conv2d(filters, filters_out, 1, padding="same", bias=False)
+            self.conv_se_expand = nn.Conv2d(filters_se, filters*self.expand_ratio, 1, padding="same")
+        self.conv_output = nn.Conv2d(filters * self.expand_ratio, filters_out, 1, padding="same", bias=False)
         self.batch_norm_last = nn.BatchNorm2d(filters_out)
         self.dropout = nn.Dropout(p=drop_rate)
-        print(self.conv_output.weight.shape)
 
     def forward(self, inputs):
         x = inputs
@@ -272,9 +285,8 @@ class Block(nn.Module):
         x = self.swish(x)
         # squeeze and excitation
         if 0 < self.se_ratio <= 1:
-            print(x.shape, 'shape before pooling')
             se = self.global_average_pooling_2d(x)
-            print(se.shape, 'shape before se reduce conv')
+
             se = self.conv_se_reduce(se)
             se = self.swish(se)
             se = self.conv_se_expand(se)
@@ -283,9 +295,8 @@ class Block(nn.Module):
         # output phase
         x = self.conv_output(x)
         x = self.batch_norm_last(x)
-
         if self.id_skip and self.strides == 1 and self.filters_in == self.filters_out:
-            if drop_rate > 0:
+            if self.drop_rate > 0:
                 x = self.dropout(x)
             x = torch.add(x, inputs)
 
@@ -296,6 +307,7 @@ def EfficientNetB0(
         include_top=True,
         pooling=None,
         classes=1000,
+        block_args = DEFAULT_BLOCKS_ARGS,
         **kwargs,
 ):
     return EfficientNet(
@@ -303,6 +315,7 @@ def EfficientNetB0(
         include_top=include_top,
         pooling=pooling,
         classes=classes,
+        block_args = DEFAULT_BLOCKS_ARGS,
         **kwargs,
     )
 
@@ -320,6 +333,7 @@ if __name__ == '__main__':
 
 
     model = EfficientNetB0()
-    inp = torch.randn((1,3,200,200))
+
+    inp = torch.randn((1,3,100,100))
     y = model(inp)
     print(y.shape)
