@@ -113,16 +113,16 @@ def round_filters(filters, divisor=8):
     return int(new_filters)
 
 
-def correct_pad(inputs, kernel_size):
+def correct_pad(input_shape, kernel_size):
     """Returns a tuple for zero-padding for 2D convolution with downsampling.
     Args:
-      inputs: Input tensor.
+      input_shape: Input img shape
       kernel_size: An integer or tuple/list of 2 integers.
     Returns:
       A tuple.
     """
     img_dim = 2
-    input_size = list(inputs.shape)[img_dim: (img_dim + 2)]
+    input_size = list(input_shape)[img_dim: (img_dim + 2)]
     # 128, 128
     if type(kernel_size):
         kernel_size = (kernel_size, kernel_size)
@@ -133,46 +133,37 @@ def correct_pad(inputs, kernel_size):
         adjust = (1 - input_size[0] % 2, 1 - input_size[1] % 2)
     correct = (kernel_size[0] // 2, kernel_size[1] // 2)
     return (
-        correct[0] - adjust[0], correct[0],
         correct[1] - adjust[1], correct[1],
+        correct[0] - adjust[0], correct[0],
     )
-
-
-class depthwise_separable_conv(nn.Module):
-    def __init__(self, nin, kernels_per_layer, nout):
-        super(depthwise_separable_conv, self).__init__()
-        self.depthwise = nn.Conv2d(nin, nin*kernels_per_layer, kernel_size=3, padding=1, groups=nin)
-        self.pointwise = nn.Conv2d(nin*kernels_per_layer, nout, kernel_size=1)
-
-    def forward(self, x):
-        out = self.depthwise(x)
-        out = self.pointwise(out)
-        return out
 
 
 class EfficientNet(nn.Module):
 
-    def __init__(self, num_channels=5, dropout_rate=0.2, drop_connect_rate=0.2, include_top=True, pooling=None,
+    def __init__(self, input_shape, num_channels=5, dropout_rate=0.2, drop_connect_rate=0.2, include_top=True, pooling=None,
                  classes=1000, block_args = DEFAULT_BLOCKS_ARGS):
 
         super().__init__()
         block_args = copy.deepcopy(DEFAULT_BLOCKS_ARGS)
-        self.transforms = torch.nn.Sequential(
-            # transforms.to_tensor(),
-            transforms.Normalize(0, 1)
+        rescale = lambda x: x * 1./255
+        self.input_transforms = transforms.Compose([
+            transforms.Lambda(rescale),
+            transforms.Normalize(0, 1),
+            transforms.Lambda(nn.ZeroPad2d(padding=correct_pad(input_shape,kernel_size=3))),
+            ]
         )
+
         self.include_top = include_top
         self.dropout_rate = dropout_rate
         self.pooling = pooling
         init_filters = round_filters(32)
         self.conv1 = nn.Conv2d(num_channels, init_filters, kernel_size=3, stride=2, padding="valid", bias=False)
-        self.batch_norm1 = nn.BatchNorm2d(init_filters)
+        self.batch_norm1 = nn.BatchNorm2d(init_filters, momentum=0.99, eps=0.001)
         self.swish = torch.nn.SiLU()
         b = 0
-        for arg in DEFAULT_BLOCKS_ARGS:
-            print(arg)
         blocks = float(sum(args['repeats'] for args in block_args))
         self.block_list = nn.ModuleList([])
+        self.outputs = {}
         for i, args in enumerate(block_args):
             assert args['repeats'] > 0
             args["filters_in"] = round_filters(args["filters_in"])
@@ -188,7 +179,7 @@ class EfficientNet(nn.Module):
         output_filters = round_filters(1280)
         self.conv_final = nn.Conv2d(args["filters_out"], output_filters, kernel_size=1, stride=1, padding="same",
                                     bias=False)
-        self.batch_norm_final = nn.BatchNorm2d(output_filters)
+        self.batch_norm_final = nn.BatchNorm2d(output_filters, momentum=0.99, eps=0.001)
 
         if include_top:
             self.global_average_pooling_2d = lambda x: torch.mean(x, (2, 3), keepdim=False)
@@ -203,20 +194,31 @@ class EfficientNet(nn.Module):
                 self.pool = lambda x: torch.amax(x, (2, 3), keepdim=False)
 
     def forward(self, inputs):
-        padding = correct_pad(inputs, 3)
-        x = F.pad(input=inputs, pad=padding, value=0)
+        # padding = correct_pad(inputs, 3)
+        # x = F.pad(input=inputs, pad=padding, value=0)
+        # same as keras  x = layers.Rescaling(1.0 / 255.0)(x)
+
+        x = self.input_transforms(inputs)
+        self.outputs['pre_conv1'] = x
         # first conv layer
-        x = self.swish(self.batch_norm1(self.conv1(x)))
+        x = self.conv1(x)
+        self.outputs['conv1'] = x
+        x = self.batch_norm1(x)
+        self.outputs['bn1'] = x
+        x = self.swish(x)
+        self.outputs['activation1'] = x
+
 
         # go through all the conv blocks
         for idx, block_i in enumerate(self.block_list):
             x = block_i(x)
+            self.outputs[f'block_{idx}'] = x.detach()
 
         # final conv layer
         x = self.conv_final(x)
         x = self.batch_norm_final(x)
         x = self.swish(x)
-
+        self.outputs['final_conv_and_swish'] = x.detach()
         # specific outputs
         if self.include_top:
             x = self.global_average_pooling_2d(x)
@@ -247,51 +249,59 @@ class Block(nn.Module):
         self.drop_rate = drop_rate
         self.swish = torch.nn.SiLU()
         self.se_ratio = se_ratio
+        self.outputs = {}
         if expand_ratio != 1:
             self.conv_expand = nn.Conv2d(filters_in, filters, kernel_size=1, padding='same', bias=False)
-            self.batch_norm_exp = nn.BatchNorm2d(filters)
+            self.batch_norm_exp = nn.BatchNorm2d(filters,momentum=0.99, eps=0.001)
 
         conv_pad = "valid" if self.strides == 2 else "same"
-        self.depth_conv = depthwise_separable_conv(filters, self.kernel_size, filters*self.expand_ratio)
-        # self.depth_conv = nn.Conv2d(filters, filters * self.expand_ratio, kernel_size=self.kernel_size, stride=strides, padding=conv_pad,
-        #                             bias=False, groups=filters)
-        self.batch_norm_depth = nn.BatchNorm2d(filters * self.expand_ratio)
+        # self.depth_conv = depthwise_separable_conv(filters, self.kernel_size, filters*self.expand_ratio)
+
+        self.depth_conv = nn.Conv2d(filters, filters, kernel_size=self.kernel_size, stride=strides, padding=conv_pad,
+                                    bias=False, groups=filters)
+        self.batch_norm_depth = nn.BatchNorm2d(filters,momentum=0.99, eps=0.001)
         if 0 < self.se_ratio <= 1:
 
             filters_se = max(1, int(filters_in * se_ratio))
             # implemented as https://github.com/keras-team/keras/blob/v2.11.0/keras/layers/pooling/global_average_pooling2d.py
             # assuming channels first because torch
             self.global_average_pooling_2d = lambda x: torch.mean(x, (2, 3), keepdim=True)
-            self.conv_se_reduce = nn.Conv2d(filters*self.expand_ratio, filters_se, 1, padding="same")
+            self.conv_se_reduce = nn.Conv2d(filters, filters_se, 1, padding="same")
             self.sigmoid = torch.nn.Sigmoid()
-            self.conv_se_expand = nn.Conv2d(filters_se, filters*self.expand_ratio, 1, padding="same")
-        self.conv_output = nn.Conv2d(filters * self.expand_ratio, filters_out, 1, padding="same", bias=False)
-        self.batch_norm_last = nn.BatchNorm2d(filters_out)
+            self.conv_se_expand = nn.Conv2d(filters_se, filters, 1, padding="same")
+        self.conv_output = nn.Conv2d(filters, filters_out, 1, padding="same", bias=False)
+        self.batch_norm_last = nn.BatchNorm2d(filters_out,momentum=0.99, eps=0.001)
         self.dropout = nn.Dropout(p=drop_rate)
 
     def forward(self, inputs):
-        x = inputs
+        x = input
         # if expanding the convolution
         if self.expand_ratio != 1:
             x = self.conv_expand(x)
+            self.outputs['conv_expand'] = x
             x = self.batch_norm_exp(x)
+            self.outputs['expand_bn'] = x
             x = self.swish(x)
+            self.outputs['expand_activation'] = x
         # if need to account for stride
         if self.strides == 2:
             padding = correct_pad(x, self.kernel_size)
             x = F.pad(input=x, pad=padding, value=0)
         x = self.depth_conv(x)
+        self.outputs['depth_conv'] = x
         x = self.batch_norm_depth(x)
+        self.outputs['depth_bn'] = x
         x = self.swish(x)
+        self.outputs['depth_activation'] = x
         # squeeze and excitation
         if 0 < self.se_ratio <= 1:
             se = self.global_average_pooling_2d(x)
-
             se = self.conv_se_reduce(se)
             se = self.swish(se)
             se = self.conv_se_expand(se)
             se = self.sigmoid(se)
             x = torch.mul(x, se)
+            self.outputs['post_se'] = x
         # output phase
         x = self.conv_output(x)
         x = self.batch_norm_last(x)
@@ -304,6 +314,7 @@ class Block(nn.Module):
 
 
 def EfficientNetB0(
+        input_shape,
         include_top=True,
         pooling=None,
         classes=1000,
@@ -311,6 +322,7 @@ def EfficientNetB0(
         **kwargs,
 ):
     return EfficientNet(
+        input_shape,
         dropout_rate=0.2,
         include_top=include_top,
         pooling=pooling,
@@ -334,6 +346,6 @@ if __name__ == '__main__':
 
     model = EfficientNetB0()
 
-    inp = torch.randn((1,3,100,100))
+    inp = torch.randn((1,5,100,100))
     y = model(inp)
     print(y.shape)
