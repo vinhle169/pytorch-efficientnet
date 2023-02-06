@@ -146,12 +146,14 @@ class EfficientNet(nn.Module):
         super().__init__()
         block_args = copy.deepcopy(DEFAULT_BLOCKS_ARGS)
         rescale = lambda x: x * 1./255
-        self.input_transforms = transforms.Compose([
-            transforms.Lambda(rescale),
-            transforms.Normalize(0, 1),
-            transforms.Lambda(nn.ZeroPad2d(padding=correct_pad(input_shape,kernel_size=3))),
-            ]
-        )
+        correct_padding =correct_pad(input_shape,kernel_size=3)
+        print(correct_padding, 'correct_padding')
+        # self.input_transforms = transforms.Compose([
+        #     transforms.Lambda(rescale),
+        #     transforms.Normalize(0, 1),
+        #     transforms.Lambda(nn.ZeroPad2d(padding=correct_padding)),
+        #     ]
+        # )
 
         self.include_top = include_top
         self.dropout_rate = dropout_rate
@@ -198,7 +200,8 @@ class EfficientNet(nn.Module):
         # x = F.pad(input=inputs, pad=padding, value=0)
         # same as keras  x = layers.Rescaling(1.0 / 255.0)(x)
 
-        x = self.input_transforms(inputs)
+        # x = self.input_transforms(inputs)
+        x = inputs
         self.outputs['pre_conv1'] = x
         # first conv layer
         x = self.conv1(x)
@@ -274,7 +277,7 @@ class Block(nn.Module):
         self.dropout = nn.Dropout(p=drop_rate)
 
     def forward(self, inputs):
-        x = input
+        x = inputs
         # if expanding the convolution
         if self.expand_ratio != 1:
             x = self.conv_expand(x)
@@ -285,8 +288,11 @@ class Block(nn.Module):
             self.outputs['expand_activation'] = x
         # if need to account for stride
         if self.strides == 2:
-            padding = correct_pad(x, self.kernel_size)
-            x = F.pad(input=x, pad=padding, value=0)
+            padding = correct_pad(x.shape, self.kernel_size)
+            out = F.pad(input=x, pad=padding, value=0)
+            x = out
+        print(x)
+        print(x.type)
         x = self.depth_conv(x)
         self.outputs['depth_conv'] = x
         x = self.batch_norm_depth(x)
