@@ -2,12 +2,15 @@ import torch
 import torchvision
 import h5py
 import copy
+import math
 # import numpy as np
 # import tensorflow as tf
 # import efficientnet.tfkeras as efn
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as transforms
+from functools import reduce
+from operator import __add__
 
 # def replace_layers(model, old, new):
 #     for n, module in model.named_children():
@@ -138,6 +141,39 @@ def correct_pad(input_shape, kernel_size):
     )
 
 
+class Conv2dSamePadding(nn.Conv2d):
+    """2D Convolutions like TensorFlow, for a dynamic image size.
+       The padding is operated in forward function by calculating dynamically.
+    """
+
+    # Tips for 'SAME' mode padding.
+    #     Given the following:
+    #         i: width or height
+    #         s: stride
+    #         k: kernel size
+    #         d: dilation
+    #         p: padding
+    #     Output after Conv2d:
+    #         o = floor((i+p-((k-1)*d+1))/s+1)
+    # If o equals i, i = floor((i+p-((k-1)*d+1))/s+1),
+    # => p = (i-1)*s+((k-1)*d+1)-i
+
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, dilation=1, groups=1, bias=True):
+        super().__init__(in_channels, out_channels, kernel_size, stride, 0, dilation, groups, bias)
+        self.stride = self.stride if len(self.stride) == 2 else [self.stride[0]] * 2
+
+    def forward(self, x):
+        ih, iw = x.size()[-2:]
+        kh, kw = self.weight.size()[-2:]
+        sh, sw = self.stride
+        oh, ow = math.ceil(ih / sh), math.ceil(iw / sw)  # change the output size according to stride ! ! !
+        pad_h = max((oh - 1) * self.stride[0] + (kh - 1) * self.dilation[0] + 1 - ih, 0)
+        pad_w = max((ow - 1) * self.stride[1] + (kw - 1) * self.dilation[1] + 1 - iw, 0)
+        if pad_h > 0 or pad_w > 0:
+            x = F.pad(x, [pad_w // 2, pad_w - pad_w // 2, pad_h // 2, pad_h - pad_h // 2])
+        return F.conv2d(x, self.weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
+
+
 class EfficientNet(nn.Module):
 
     def __init__(self, input_shape, num_channels=5, dropout_rate=0.2, drop_connect_rate=0.2, include_top=True, pooling=None,
@@ -147,7 +183,7 @@ class EfficientNet(nn.Module):
         block_args = copy.deepcopy(DEFAULT_BLOCKS_ARGS)
         rescale = lambda x: x * 1./255
         correct_padding =correct_pad(input_shape,kernel_size=3)
-        print(correct_padding, 'correct_padding')
+        # print(correct_padding, 'correct_padding')
         # self.input_transforms = transforms.Compose([
         #     transforms.Lambda(rescale),
         #     transforms.Normalize(0, 1),
@@ -159,7 +195,7 @@ class EfficientNet(nn.Module):
         self.dropout_rate = dropout_rate
         self.pooling = pooling
         init_filters = round_filters(32)
-        self.conv1 = nn.Conv2d(num_channels, init_filters, kernel_size=3, stride=2, padding="valid", bias=False)
+        self.conv1 = Conv2dSamePadding(num_channels, init_filters, kernel_size=3, stride=2, bias=False)
         self.batch_norm1 = nn.BatchNorm2d(init_filters, momentum=0.99, eps=0.001)
         self.swish = torch.nn.SiLU()
         b = 0
@@ -179,7 +215,7 @@ class EfficientNet(nn.Module):
                 self.block_list.append(Block(drop_rate=drop_connect_rate * b / blocks, **args))
                 b += 1
         output_filters = round_filters(1280)
-        self.conv_final = nn.Conv2d(args["filters_out"], output_filters, kernel_size=1, stride=1, padding="same",
+        self.conv_final = Conv2dSamePadding(args["filters_out"], output_filters, kernel_size=1, stride=1,
                                     bias=False)
         self.batch_norm_final = nn.BatchNorm2d(output_filters, momentum=0.99, eps=0.001)
 
@@ -202,14 +238,14 @@ class EfficientNet(nn.Module):
 
         # x = self.input_transforms(inputs)
         x = inputs
-        self.outputs['pre_conv1'] = x
+        self.outputs['pre_conv1'] = x.detach()
         # first conv layer
         x = self.conv1(x)
-        self.outputs['conv1'] = x
+        self.outputs['conv1'] = x.detach()
         x = self.batch_norm1(x)
-        self.outputs['bn1'] = x
+        self.outputs['bn1'] = x.detach()
         x = self.swish(x)
-        self.outputs['activation1'] = x
+        self.outputs['activation1'] = x.detach()
 
 
         # go through all the conv blocks
@@ -254,25 +290,24 @@ class Block(nn.Module):
         self.se_ratio = se_ratio
         self.outputs = {}
         if expand_ratio != 1:
-            self.conv_expand = nn.Conv2d(filters_in, filters, kernel_size=1, padding='same', bias=False)
+            self.conv_expand = Conv2dSamePadding(filters_in, filters, kernel_size=1, bias=False)
             self.batch_norm_exp = nn.BatchNorm2d(filters,momentum=0.99, eps=0.001)
 
-        conv_pad = "valid" if self.strides == 2 else "same"
-        # self.depth_conv = depthwise_separable_conv(filters, self.kernel_size, filters*self.expand_ratio)
-
-        self.depth_conv = nn.Conv2d(filters, filters, kernel_size=self.kernel_size, stride=strides, padding=conv_pad,
+        # depth-wise convolution
+        self.depth_conv = Conv2dSamePadding(filters, filters, kernel_size=self.kernel_size, stride=strides,
                                     bias=False, groups=filters)
         self.batch_norm_depth = nn.BatchNorm2d(filters,momentum=0.99, eps=0.001)
-        if 0 < self.se_ratio <= 1:
 
+        # squeeze excitation phase
+        if 0 < self.se_ratio <= 1:
             filters_se = max(1, int(filters_in * se_ratio))
             # implemented as https://github.com/keras-team/keras/blob/v2.11.0/keras/layers/pooling/global_average_pooling2d.py
             # assuming channels first because torch
             self.global_average_pooling_2d = lambda x: torch.mean(x, (2, 3), keepdim=True)
-            self.conv_se_reduce = nn.Conv2d(filters, filters_se, 1, padding="same")
+            self.conv_se_reduce = Conv2dSamePadding(filters, filters_se, 1, bias=True)
             self.sigmoid = torch.nn.Sigmoid()
-            self.conv_se_expand = nn.Conv2d(filters_se, filters, 1, padding="same")
-        self.conv_output = nn.Conv2d(filters, filters_out, 1, padding="same", bias=False)
+            self.conv_se_expand = Conv2dSamePadding(filters_se, filters, 1, bias=True)
+        self.conv_output = Conv2dSamePadding(filters, filters_out, 1, bias=False)
         self.batch_norm_last = nn.BatchNorm2d(filters_out,momentum=0.99, eps=0.001)
         self.dropout = nn.Dropout(p=drop_rate)
 
@@ -281,24 +316,23 @@ class Block(nn.Module):
         # if expanding the convolution
         if self.expand_ratio != 1:
             x = self.conv_expand(x)
-            self.outputs['conv_expand'] = x
+            self.outputs['conv_expand'] = x.detach()
             x = self.batch_norm_exp(x)
-            self.outputs['expand_bn'] = x
+            self.outputs['expand_bn'] = x.detach()
             x = self.swish(x)
-            self.outputs['expand_activation'] = x
+            self.outputs['expand_activation'] = x.detach()
         # if need to account for stride
-        if self.strides == 2:
-            padding = correct_pad(x.shape, self.kernel_size)
-            out = F.pad(input=x, pad=padding, value=0)
-            x = out
-        print(x)
-        print(x.type)
+        # if self.strides == 2:
+        #     padding = correct_pad(x.shape, self.kernel_size)
+        #     out = F.pad(input=x, pad=padding, value=0)
+        #     x = out
+
         x = self.depth_conv(x)
-        self.outputs['depth_conv'] = x
+        self.outputs['depth_conv'] = x.detach()
         x = self.batch_norm_depth(x)
-        self.outputs['depth_bn'] = x
+        self.outputs['depth_bn'] = x.detach()
         x = self.swish(x)
-        self.outputs['depth_activation'] = x
+        self.outputs['depth_activation'] = x.detach()
         # squeeze and excitation
         if 0 < self.se_ratio <= 1:
             se = self.global_average_pooling_2d(x)
@@ -307,7 +341,7 @@ class Block(nn.Module):
             se = self.conv_se_expand(se)
             se = self.sigmoid(se)
             x = torch.mul(x, se)
-            self.outputs['post_se'] = x
+            self.outputs['post_se'] = x.detach()
         # output phase
         x = self.conv_output(x)
         x = self.batch_norm_last(x)
